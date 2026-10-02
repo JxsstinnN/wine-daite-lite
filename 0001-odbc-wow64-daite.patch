@@ -1,0 +1,238 @@
+diff --git a/dlls/odbc32/proxyodbc.c b/dlls/odbc32/proxyodbc.c
+index dcd38eb..82daa65 100644
+--- a/dlls/odbc32/proxyodbc.c
++++ b/dlls/odbc32/proxyodbc.c
+@@ -1339,7 +1339,11 @@ static SQLRETURN alloc_env_handle( struct env_handle *env )
+     if (!env->win32_funcs)
+     {
+         struct SQLAllocHandle_params params = { SQL_HANDLE_ENV, 0, &env->unix_handle };
+-        ret = ODBC_CALL( SQLAllocHandle, &params );
++        NTSTATUS status = ODBC_CALL( SQLAllocHandle, &params );
++
++        TRACE( "unix SQLAllocHandle(SQL_HANDLE_ENV) status %#lx, handle %s\n", status,
++               wine_dbgstr_longlong(env->unix_handle) );
++        ret = status;
+     }
+     else
+     {
+@@ -1575,7 +1579,11 @@ static SQLRETURN alloc_con_handle( struct connection *con )
+     if (con->env->unix_handle)
+     {
+         struct SQLAllocHandle_params params = { SQL_HANDLE_DBC, con->env->unix_handle, &con->hdr.unix_handle };
+-        ret = ODBC_CALL( SQLAllocHandle, &params );
++        NTSTATUS status = ODBC_CALL( SQLAllocHandle, &params );
++
++        TRACE( "unix SQLAllocHandle(SQL_HANDLE_DBC) status %#lx, handle %s\n", status,
++               wine_dbgstr_longlong(con->hdr.unix_handle) );
++        ret = status;
+     }
+     else
+     {
+@@ -1602,6 +1610,15 @@ static SQLRETURN create_con( struct connection *con )
+     if (con->login_timeout_set &&
+             set_con_attr( con, SQL_ATTR_LOGIN_TIMEOUT, INT_PTR(con->attr_login_timeout), 0 ))
+         WARN( "failed to set login timeout\n" );
++    if (con->packet_size_set &&
++            set_con_attr( con, SQL_ATTR_PACKET_SIZE, INT_PTR(con->attr_packet_size), 0 ))
++        WARN( "failed to set packet size\n" );
++    if (con->autocommit_set &&
++            set_con_attr( con, SQL_ATTR_AUTOCOMMIT, INT_PTR(con->attr_autocommit), 0 ))
++        WARN( "failed to set autocommit\n" );
++    if (con->odbc_cursors_set &&
++            set_con_attr( con, SQL_ATTR_ODBC_CURSORS, INT_PTR(con->attr_odbc_cursors), 0 ))
++        WARN( "failed to set ODBC cursors\n" );
+ 
+     for (i = 0; i < con->driver_attr_count; i++)
+         if ((ret = set_con_attr( con, con->driver_attr[i].id, con->driver_attr[i].value, con->driver_attr[i].len )))
+@@ -3993,6 +4010,33 @@ static SQLRETURN set_connect_option_win32_a( struct connection *con, SQLUSMALLIN
+     return ret;
+ }
+ 
++static SQLRETURN store_connect_option( struct connection *con, SQLUSMALLINT option, SQLULEN value )
++{
++    switch (option)
++    {
++    case SQL_LOGIN_TIMEOUT:
++        con->attr_login_timeout = value;
++        con->login_timeout_set = TRUE;
++        break;
++    case SQL_PACKET_SIZE:
++        con->attr_packet_size = value;
++        con->packet_size_set = TRUE;
++        break;
++    case SQL_AUTOCOMMIT:
++        con->attr_autocommit = value;
++        con->autocommit_set = TRUE;
++        break;
++    case SQL_ODBC_CURSORS:
++        con->attr_odbc_cursors = value;
++        con->odbc_cursors_set = TRUE;
++        break;
++    default:
++        FIXME( "unhandled pre-connect option %u\n", option );
++        return SQL_ERROR;
++    }
++    return SQL_SUCCESS;
++}
++
+ /*************************************************************************
+  *				SQLSetConnectOption           [ODBC32.050]
+  */
+@@ -4013,6 +4057,10 @@ SQLRETURN WINAPI SQLSetConnectOption(SQLHDBC ConnectionHandle, SQLUSMALLINT Opti
+     {
+         ret = set_connect_option_win32_a( con, Option, Value );
+     }
++    else
++    {
++        ret = store_connect_option( con, Option, Value );
++    }
+ 
+     TRACE("Returning %d\n", ret);
+     unlock_object( &con->hdr );
+@@ -6102,6 +6150,18 @@ static SQLRETURN driver_connect_unix_a( struct connection *con, SQLHWND window,
+     return ODBC_CALL( SQLDriverConnect, &params );
+ }
+ 
++static WCHAR *append_connect_string_attribute( WCHAR *str, const WCHAR *attribute )
++{
++    SIZE_T len = wcslen( str ), attr_len = wcslen( attribute );
++    BOOL separator = len && str[len - 1] != ';';
++    WCHAR *ret;
++
++    if (!(ret = realloc( str, (len + separator + attr_len + 1) * sizeof(*ret) ))) return NULL;
++    if (separator) ret[len++] = ';';
++    memcpy( ret + len, attribute, (attr_len + 1) * sizeof(*ret) );
++    return ret;
++}
++
+ /*************************************************************************
+  *				SQLDriverConnect           [ODBC32.041]
+  */
+@@ -6123,8 +6183,7 @@ SQLRETURN WINAPI SQLDriverConnect(SQLHDBC ConnectionHandle, SQLHWND WindowHandle
+ 
+     if (!con) return SQL_INVALID_HANDLE;
+ 
+-    if (parse_connect_string( &attrs, strW ) || !(connect_string = build_connect_string( &attrs )) ||
+-        !(strA = (SQLCHAR *)strdupWA( connect_string ))) goto done;
++    if (parse_connect_string( &attrs, strW ) || !(connect_string = build_connect_string( &attrs ))) goto done;
+ 
+     if (!(datasource = get_attribute( &attrs, L"DSN" )) && !(drivername = get_attribute( &attrs, L"DRIVER" )))
+     {
+@@ -6139,14 +6198,27 @@ SQLRETURN WINAPI SQLDriverConnect(SQLHDBC ConnectionHandle, SQLHWND WindowHandle
+     }
+ 
+     if (!SUCCESS((ret = prepare_connection( filename, con )))) goto done;
++
++    if (!con->hdr.win32_handle && !get_attribute( &attrs, L"TrustServerCertificate" ))
++    {
++        WCHAR *tmp = append_connect_string_attribute( connect_string, L"TrustServerCertificate=yes" );
++
++        if (!tmp) goto done;
++        connect_string = tmp;
++        TRACE( "added TrustServerCertificate=yes for Unix driver\n" );
++    }
++    if (!(strA = (SQLCHAR *)strdupWA( connect_string ))) goto done;
++
+     if (con->hdr.win32_handle)
+     {
+-        ret = driver_connect_win32_a( con, WindowHandle, strA, Length, OutConnectionString, BufferLength, Length2,
++        ret = driver_connect_win32_a( con, WindowHandle, strA, Length,
++                                      OutConnectionString, BufferLength, Length2,
+                                       DriverCompletion );
+     }
+     else
+     {
+-        ret = driver_connect_unix_a( con, WindowHandle, strA, Length, OutConnectionString, BufferLength, Length2,
++        ret = driver_connect_unix_a( con, WindowHandle, strA, SQL_NTS,
++                                     OutConnectionString, BufferLength, Length2,
+                                      DriverCompletion );
+     }
+ 
+@@ -7668,6 +7740,10 @@ SQLRETURN WINAPI SQLSetConnectOptionW(SQLHDBC ConnectionHandle, SQLUSMALLINT Opt
+     {
+         ret = set_connect_option_win32_w( con, Option, Value );
+     }
++    else
++    {
++        ret = store_connect_option( con, Option, Value );
++    }
+ 
+     TRACE("Returning %d\n", ret);
+     unlock_object( &con->hdr );
+diff --git a/dlls/odbc32/unixlib.c b/dlls/odbc32/unixlib.c
+index cf20bf3..47a6bf5 100644
+--- a/dlls/odbc32/unixlib.c
++++ b/dlls/odbc32/unixlib.c
+@@ -1568,6 +1568,44 @@ C_ASSERT( ARRAYSIZE( __wine_unix_call_funcs) == unix_funcs_count );
+ 
+ typedef ULONG PTR32;
+ 
++static NTSTATUS wow64_SQLAllocHandle( void *args )
++{
++    struct
++    {
++        INT16  HandleType;
++        UINT64 InputHandle;
++        PTR32  OutputHandle;
++    } const *params32 = args;
++
++    struct SQLAllocHandle_params params =
++    {
++        params32->HandleType,
++        params32->InputHandle,
++        ULongToPtr(params32->OutputHandle)
++    };
++
++    return wrap_SQLAllocHandle( &params );
++}
++
++static NTSTATUS wow64_SQLAllocHandleStd( void *args )
++{
++    struct
++    {
++        INT16  HandleType;
++        UINT64 InputHandle;
++        PTR32  OutputHandle;
++    } const *params32 = args;
++
++    struct SQLAllocHandleStd_params params =
++    {
++        params32->HandleType,
++        params32->InputHandle,
++        ULongToPtr(params32->OutputHandle)
++    };
++
++    return wrap_SQLAllocHandleStd( &params );
++}
++
+ static NTSTATUS wow64_SQLBindCol( void *args )
+ {
+     struct
+@@ -3703,8 +3741,8 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
+ {
+     odbc_process_attach,
+     odbc_process_detach,
+-    wrap_SQLAllocHandle,
+-    wrap_SQLAllocHandleStd,
++    wow64_SQLAllocHandle,
++    wow64_SQLAllocHandleStd,
+     wow64_SQLBindCol,
+     wow64_SQLBindParameter,
+     wow64_SQLBrowseConnect,
+diff --git a/dlls/odbc32/unixlib.h b/dlls/odbc32/unixlib.h
+index 5a458e6..716f3ce 100644
+--- a/dlls/odbc32/unixlib.h
++++ b/dlls/odbc32/unixlib.h
+@@ -235,6 +235,12 @@ struct connection
+     UINT32 attr_con_timeout;
+     BOOL login_timeout_set;
+     UINT32 attr_login_timeout;
++    BOOL autocommit_set;
++    UINT32 attr_autocommit;
++    BOOL odbc_cursors_set;
++    UINT32 attr_odbc_cursors;
++    BOOL packet_size_set;
++    UINT32 attr_packet_size;
+     /* driver attributes */
+     struct driver_attribute *driver_attr;
+     UINT32 driver_attr_count;
